@@ -78,13 +78,154 @@ function showToast(message) {
 // ==========================================
 let currentUser = null;
 
-// Yerel auth oturumunu kontrol et
+// --- Auth Yardımcıları ---
+const SESSION_KEY = 'localUserSession';
+const USERS_KEY = 'localUsers';
+const SESSION_DAYS = 1;        // Beni hatırla kapalıysa 1 gün
+const REMEMBER_DAYS = 30;      // Beni hatırla açıksa 30 gün
+
+const eyeIcon = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>`;
+const eyeOffIcon = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><path d="M1 1l22 22"/></svg>`;
+
+// Yerel oturumu kontrol et (süre dolmuşsa temizle)
 function getStoredLocalUser() {
   try {
-    return JSON.parse(localStorage.getItem('localUserSession'));
+    const session = JSON.parse(localStorage.getItem(SESSION_KEY));
+    if (!session) return null;
+    if (!session.expiresAt || Date.now() > session.expiresAt) {
+      localStorage.removeItem(SESSION_KEY);
+      return null;
+    }
+    return session;
   } catch {
     return null;
   }
+}
+
+function isValidEmail(email) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
+
+function randomSalt() {
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+// Şifreyi SHA-256 ile hash'le (file:// ortamı için yedek algoritma ile)
+async function hashPassword(password, salt) {
+  const input = `${salt}:${password}`;
+  if (window.crypto && crypto.subtle) {
+    try {
+      const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(input));
+      return 'sha256:' + Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('');
+    } catch {}
+  }
+  let h1 = 0x811c9dc5, h2 = 0x1000193;
+  for (let i = 0; i < input.length; i++) {
+    h1 = Math.imul(h1 ^ input.charCodeAt(i), 0x01000193) >>> 0;
+    h2 = Math.imul(h2 ^ input.charCodeAt(i), 0x85ebca6b) >>> 0;
+  }
+  return 'fnv:' + h1.toString(16).padStart(8, '0') + h2.toString(16).padStart(8, '0');
+}
+
+// Eski düz metin şifreleri hash'li formata taşı
+async function migrateLocalUsers() {
+  let users;
+  try { users = JSON.parse(localStorage.getItem(USERS_KEY) || '[]'); } catch { return; }
+  let changed = false;
+  for (const user of users) {
+    if (user.password && !user.passwordHash) {
+      user.salt = randomSalt();
+      user.passwordHash = await hashPassword(user.password, user.salt);
+      delete user.password;
+      changed = true;
+    }
+  }
+  if (changed) localStorage.setItem(USERS_KEY, JSON.stringify(users));
+}
+
+// Süreli yerel oturum oluştur
+function createLocalSession(user, remember) {
+  const days = remember ? REMEMBER_DAYS : SESSION_DAYS;
+  const session = {
+    uid: user.uid,
+    displayName: user.displayName,
+    email: user.email,
+    plan: user.plan || 'Ücretsiz Plan',
+    remember: !!remember,
+    createdAt: Date.now(),
+    expiresAt: Date.now() + days * 24 * 60 * 60 * 1000
+  };
+  localStorage.setItem(SESSION_KEY, JSON.stringify(session));
+  return session;
+}
+
+function setAuthLoading(loading) {
+  const btn = document.getElementById('authSubmitBtn');
+  if (!btn) return;
+  btn.classList.toggle('loading', loading);
+  btn.disabled = loading;
+}
+
+function firebaseAuthError(e) {
+  const messages = {
+    'auth/user-not-found': 'Bu e-posta ile kayıtlı kullanıcı bulunamadı.',
+    'auth/wrong-password': 'Şifre yanlış.',
+    'auth/invalid-email': 'Geçersiz e-posta adresi.',
+    'auth/invalid-credential': 'E-posta veya şifre hatalı.',
+    'auth/user-disabled': 'Bu hesap devre dışı bırakılmış.',
+    'auth/too-many-requests': 'Çok fazla deneme. Lütfen biraz sonra tekrar deneyin.',
+    'auth/network-request-failed': 'Bağlantı hatası. İnternet bağlantınızı kontrol edin.',
+    'auth/email-already-in-use': 'Bu e-posta zaten kullanımda.',
+    'auth/weak-password': 'Şifre çok zayıf (en az 6 karakter olmalı).'
+  };
+  return messages[e.code] || 'İşlem başarısız: ' + (e.message || 'Bilinmeyen hata');
+}
+
+function passwordScore(pw) {
+  let score = 0;
+  if (pw.length >= 8) score++;
+  if (pw.length >= 12) score++;
+  if (/[a-z]/.test(pw) && /[A-Z]/.test(pw)) score++;
+  if (/\d/.test(pw)) score++;
+  if (/[^A-Za-z0-9]/.test(pw)) score++;
+  return Math.min(score, 4);
+}
+
+// Formdaki şifre göster/gizle, güç göstergesi ve Enter kısayollarını bağla
+function bindAuthForm() {
+  const form = document.getElementById('authForm');
+  if (!form) return;
+
+  form.querySelectorAll('.password-toggle').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const input = document.getElementById(btn.dataset.target);
+      if (!input) return;
+      const show = input.type === 'password';
+      input.type = show ? 'text' : 'password';
+      btn.innerHTML = show ? eyeOffIcon : eyeIcon;
+      btn.setAttribute('aria-label', show ? 'Şifreyi gizle' : 'Şifreyi göster');
+    });
+  });
+
+  const pw = document.getElementById('authPassword');
+  const meter = document.getElementById('strengthMeter');
+  if (pw && meter) {
+    pw.addEventListener('input', () => {
+      const score = passwordScore(pw.value);
+      meter.className = 'strength-meter' + (pw.value ? ' s' + score : '');
+    });
+  }
+
+  form.querySelectorAll('input').forEach(input => {
+    input.addEventListener('keydown', e => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        document.getElementById('authSubmitBtn')?.click();
+      }
+    });
+    input.addEventListener('input', () => input.classList.remove('invalid'));
+  });
 }
 
 function openAuthModal() {
@@ -104,15 +245,25 @@ function switchAuthTab(tab) {
   error.textContent = '';
 
   const modeBadge = !isFirebaseConfigured 
-    ? `<div style="font-size:11px;background:var(--paper);padding:6px 10px;border-radius:8px;margin-bottom:12px;color:var(--muted);text-align:center">💡 <strong>Geliştirici Modu:</strong> Firebase API anahtarları henüz girilmediği için yerel güvenli mod aktif. İstediğiniz bilgilerle anında hesap oluşturup giriş yapabilirsiniz.</div>` 
-    : '';
+    ? `<div class="auth-mode-badge">🔒 <strong>Yerel Güvenli Mod:</strong> Şifreler tarayıcında SHA-256 ile şifrelenerek saklanır. Firebase anahtarları eklendiğinde otomatik olarak bulut moduna geçer.</div>` 
+    : `<div class="auth-mode-badge cloud">☁️ <strong>Bulut Modu:</strong> Firebase kimlik doğrulama aktif. Oturumun tüm cihazlarında geçerli.</div>`;
 
   if (tab === 'login') {
     form.innerHTML = `
       ${modeBadge}
-      <div class="auth-field"><label>E-posta</label><input type="email" id="authEmail" placeholder="ornek@email.com"></div>
-      <div class="auth-field"><label>Şifre</label><input type="password" id="authPassword" placeholder="••••••••"></div>
-      <button class="auth-submit" id="authSubmitBtn">Giriş Yap</button>
+      <div class="auth-field"><label for="authEmail">E-posta</label><input type="email" id="authEmail" placeholder="ornek@email.com" autocomplete="email"></div>
+      <div class="auth-field">
+        <label for="authPassword">Şifre</label>
+        <div class="password-wrap">
+          <input type="password" id="authPassword" placeholder="••••••••" autocomplete="current-password">
+          <button type="button" class="password-toggle" data-target="authPassword" aria-label="Şifreyi göster">${eyeIcon}</button>
+        </div>
+      </div>
+      <div class="auth-row">
+        <label class="remember-label"><input type="checkbox" id="rememberMe" checked> Beni hatırla</label>
+        <button type="button" class="forgot-link" id="forgotPassword">Şifremi unuttum</button>
+      </div>
+      <button class="auth-submit" id="authSubmitBtn"><span class="btn-spinner"></span><span class="btn-label">Giriş Yap</span></button>
       <div class="auth-divider">veya</div>
       <button class="auth-google" id="googleSignIn">
         <svg viewBox="0 0 24 24"><path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z" fill="#4285F4"/><path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853"/><path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" fill="#FBBC05"/><path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335"/></svg>
@@ -121,13 +272,29 @@ function switchAuthTab(tab) {
     `;
     document.getElementById('authSubmitBtn').addEventListener('click', handleLogin);
     document.getElementById('googleSignIn').addEventListener('click', handleGoogleLogin);
+    bindAuthForm();
   } else {
     form.innerHTML = `
       ${modeBadge}
-      <div class="auth-field"><label>Ad Soyad</label><input type="text" id="authName" placeholder="Adınız Soyadınız"></div>
-      <div class="auth-field"><label>E-posta</label><input type="email" id="authEmail" placeholder="ornek@email.com"></div>
-      <div class="auth-field"><label>Şifre</label><input type="password" id="authPassword" placeholder="En az 6 karakter"></div>
-      <button class="auth-submit" id="authSubmitBtn">Kayıt Ol</button>
+      <div class="auth-field"><label for="authName">Ad Soyad</label><input type="text" id="authName" placeholder="Adınız Soyadınız" autocomplete="name"></div>
+      <div class="auth-field"><label for="authEmail">E-posta</label><input type="email" id="authEmail" placeholder="ornek@email.com" autocomplete="email"></div>
+      <div class="auth-field">
+        <label for="authPassword">Şifre</label>
+        <div class="password-wrap">
+          <input type="password" id="authPassword" placeholder="En az 8 karakter" autocomplete="new-password">
+          <button type="button" class="password-toggle" data-target="authPassword" aria-label="Şifreyi göster">${eyeIcon}</button>
+        </div>
+        <div class="strength-meter" id="strengthMeter"><i></i><i></i><i></i><i></i></div>
+        <small class="field-hint">En az 8 karakter, bir harf ve bir rakam içermeli.</small>
+      </div>
+      <div class="auth-field">
+        <label for="authPassword2">Şifre (Tekrar)</label>
+        <div class="password-wrap">
+          <input type="password" id="authPassword2" placeholder="Şifreyi tekrar girin" autocomplete="new-password">
+          <button type="button" class="password-toggle" data-target="authPassword2" aria-label="Şifreyi göster">${eyeIcon}</button>
+        </div>
+      </div>
+      <button class="auth-submit" id="authSubmitBtn"><span class="btn-spinner"></span><span class="btn-label">Kayıt Ol</span></button>
       <div class="auth-divider">veya</div>
       <button class="auth-google" id="googleSignIn">
         <svg viewBox="0 0 24 24"><path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z" fill="#4285F4"/><path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853"/><path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" fill="#FBBC05"/><path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335"/></svg>
@@ -136,6 +303,7 @@ function switchAuthTab(tab) {
     `;
     document.getElementById('authSubmitBtn').addEventListener('click', handleRegister);
     document.getElementById('googleSignIn').addEventListener('click', handleGoogleLogin);
+    bindAuthForm();
   }
 }
 
@@ -149,34 +317,43 @@ function showAuthError(msg) {
 async function handleLogin() {
   const email = document.getElementById('authEmail').value.trim();
   const password = document.getElementById('authPassword').value;
+  const remember = document.getElementById('rememberMe')?.checked ?? true;
+
   if (!email || !password) return showAuthError('Lütfen tüm alanları doldurun.');
+  if (!isValidEmail(email)) return showAuthError('Geçerli bir e-posta adresi girin.');
 
   if (isFirebaseConfigured && auth) {
+    setAuthLoading(true);
     try {
+      await auth.setPersistence(remember ? firebase.auth.Auth.Persistence.LOCAL : firebase.auth.Auth.Persistence.SESSION);
       await auth.signInWithEmailAndPassword(email, password);
       closeAuthModal();
-      showToast('Giriş başarılı!');
+      showToast('Giriş başarılı! 👋');
     } catch (e) {
-      const messages = {
-        'auth/user-not-found': 'Bu e-posta ile kayıtlı kullanıcı bulunamadı.',
-        'auth/wrong-password': 'Şifre yanlış.',
-        'auth/invalid-email': 'Geçersiz e-posta adresi.',
-        'auth/too-many-requests': 'Çok fazla deneme. Lütfen daha sonra tekrar deneyin.'
-      };
-      showAuthError(messages[e.code] || 'Giriş başarısız: ' + e.message);
+      showAuthError(firebaseAuthError(e));
+    } finally {
+      setAuthLoading(false);
     }
   } else {
-    // Yerel Mod
-    const users = JSON.parse(localStorage.getItem('localUsers') || '[]');
+    // Yerel Güvenli Mod
+    setAuthLoading(true);
+    await migrateLocalUsers();
+    const users = JSON.parse(localStorage.getItem(USERS_KEY) || '[]');
     const user = users.find(u => u.email.toLowerCase() === email.toLowerCase());
-    if (!user || user.password !== password) {
-      return showAuthError('E-posta veya şifre hatalı.');
+    if (!user) {
+      setAuthLoading(false);
+      return showAuthError('Bu e-posta ile kayıtlı kullanıcı bulunamadı. Yeni hesap oluşturmayı dene.');
     }
-    const session = { uid: user.uid, displayName: user.displayName, email: user.email, plan: 'Ücretsiz Plan' };
-    localStorage.setItem('localUserSession', JSON.stringify(session));
+    const hash = await hashPassword(password, user.salt);
+    if (hash !== user.passwordHash) {
+      setAuthLoading(false);
+      return showAuthError('Şifre yanlış. Lütfen tekrar deneyin.');
+    }
+    const session = createLocalSession(user, remember);
     updateProfileUI(session);
     closeAuthModal();
-    showToast(`Hoş geldin, ${session.displayName}!`);
+    showToast(`Hoş geldin, ${session.displayName}! 👋`);
+    setAuthLoading(false);
   }
 }
 
@@ -185,43 +362,57 @@ async function handleRegister() {
   const name = document.getElementById('authName').value.trim();
   const email = document.getElementById('authEmail').value.trim();
   const password = document.getElementById('authPassword').value;
-  if (!name || !email || !password) return showAuthError('Lütfen tüm alanları doldurun.');
-  if (password.length < 6) return showAuthError('Şifre en az 6 karakter olmalıdır.');
+  const password2 = document.getElementById('authPassword2').value;
+
+  if (!name || !email || !password || !password2) return showAuthError('Lütfen tüm alanları doldurun.');
+  if (!isValidEmail(email)) return showAuthError('Geçerli bir e-posta adresi girin.');
+  if (password.length < 8) return showAuthError('Şifre en az 8 karakter olmalıdır.');
+  if (!/[A-Za-z]/.test(password) || !/\d/.test(password)) return showAuthError('Şifre en az bir harf ve bir rakam içermelidir.');
+  if (password !== password2) return showAuthError('Şifreler birbiriyle eşleşmiyor.');
 
   if (isFirebaseConfigured && auth) {
+    setAuthLoading(true);
     try {
       const cred = await auth.createUserWithEmailAndPassword(email, password);
       await cred.user.updateProfile({ displayName: name });
       if (db) {
         await db.collection('users').doc(cred.user.uid).set({
           name, email, createdAt: firebase.firestore.FieldValue.serverTimestamp(), plan: 'free'
-        });
+        }, { merge: true });
       }
       closeAuthModal();
-      showToast('Hesap başarıyla oluşturuldu!');
+      showToast('Hesap başarıyla oluşturuldu! 🎉');
     } catch (e) {
-      const messages = {
-        'auth/email-already-in-use': 'Bu e-posta zaten kullanımda.',
-        'auth/invalid-email': 'Geçersiz e-posta adresi.',
-        'auth/weak-password': 'Şifre çok zayıf.'
-      };
-      showAuthError(messages[e.code] || 'Kayıt başarısız: ' + e.message);
+      showAuthError(firebaseAuthError(e));
+    } finally {
+      setAuthLoading(false);
     }
   } else {
-    // Yerel Mod
-    const users = JSON.parse(localStorage.getItem('localUsers') || '[]');
+    // Yerel Güvenli Mod
+    setAuthLoading(true);
+    await migrateLocalUsers();
+    const users = JSON.parse(localStorage.getItem(USERS_KEY) || '[]');
     if (users.some(u => u.email.toLowerCase() === email.toLowerCase())) {
-      return showAuthError('Bu e-posta zaten kayıtlı.');
+      setAuthLoading(false);
+      return showAuthError('Bu e-posta zaten kayıtlı. Giriş yapmayı dene.');
     }
-    const newUser = { uid: 'user_' + Date.now(), displayName: name, email, password };
+    const salt = randomSalt();
+    const newUser = {
+      uid: 'user_' + Date.now(),
+      displayName: name,
+      email,
+      salt,
+      passwordHash: await hashPassword(password, salt),
+      createdAt: Date.now()
+    };
     users.push(newUser);
-    localStorage.setItem('localUsers', JSON.stringify(users));
+    localStorage.setItem(USERS_KEY, JSON.stringify(users));
 
-    const session = { uid: newUser.uid, displayName: name, email, plan: 'Ücretsiz Plan' };
-    localStorage.setItem('localUserSession', JSON.stringify(session));
+    const session = createLocalSession(newUser, true);
     updateProfileUI(session);
     closeAuthModal();
-    showToast(`Hesabın oluşturuldu, ${name}!`);
+    showToast(`Hesabın oluşturuldu, ${name}! 🎉`);
+    setAuthLoading(false);
   }
 }
 
@@ -229,36 +420,34 @@ async function handleRegister() {
 async function handleGoogleLogin() {
   if (isFirebaseConfigured && auth && googleProvider) {
     try {
+      await auth.setPersistence(firebase.auth.Auth.Persistence.LOCAL);
       const result = await auth.signInWithPopup(googleProvider);
       const user = result.user;
       if (db) {
-        const doc = await db.collection('users').doc(user.uid).get();
-        if (!doc.exists) {
-          await db.collection('users').doc(user.uid).set({
-            name: user.displayName, email: user.email,
-            createdAt: firebase.firestore.FieldValue.serverTimestamp(), plan: 'free'
-          });
-        }
+        await db.collection('users').doc(user.uid).set({
+          name: user.displayName, email: user.email,
+          createdAt: firebase.firestore.FieldValue.serverTimestamp(), plan: 'free'
+        }, { merge: true });
       }
       closeAuthModal();
-      showToast('Google ile giriş yapıldı!');
+      showToast('Google ile giriş yapıldı! 🎉');
     } catch (e) {
-      if (e.code !== 'auth/popup-closed-by-user') {
-        showAuthError('Google girişi başarısız: ' + e.message);
+      if (e.code !== 'auth/popup-closed-by-user' && e.code !== 'auth/cancelled-popup-request') {
+        showAuthError('Google girişi başarısız: ' + (e.message || e.code));
       }
     }
   } else {
     // Yerel Demo Google Girişi
-    const session = {
+    const demoUser = {
       uid: 'google_demo_user',
       displayName: 'Demo Google Kullanıcısı',
       email: 'kullanici@gmail.com',
       plan: 'Pro Plan (Demo)'
     };
-    localStorage.setItem('localUserSession', JSON.stringify(session));
+    const session = createLocalSession(demoUser, true);
     updateProfileUI(session);
     closeAuthModal();
-    showToast('Demo hesabı ile giriş yapıldı!');
+    showToast('Demo hesabı ile giriş yapıldı! 🎉');
   }
 }
 
@@ -266,11 +455,28 @@ async function handleGoogleLogin() {
 async function handleLogout() {
   if (isFirebaseConfigured && auth) {
     await auth.signOut();
-  } else {
-    localStorage.removeItem('localUserSession');
-    updateProfileUI(null);
   }
-  showToast('Çıkış yapıldı');
+  localStorage.removeItem(SESSION_KEY);
+  updateProfileUI(null);
+  showToast('Çıkış yapıldı. Görüşürüz! 👋');
+}
+
+// Şifre sıfırlama
+async function handleForgotPassword() {
+  const email = document.getElementById('authEmail')?.value.trim();
+  if (!email || !isValidEmail(email)) {
+    return showAuthError('Şifre sıfırlama için geçerli bir e-posta adresi girin.');
+  }
+  if (isFirebaseConfigured && auth) {
+    try {
+      await auth.sendPasswordResetEmail(email);
+      showToast('Şifre sıfırlama bağlantısı e-postana gönderildi 📧');
+    } catch (e) {
+      showAuthError(firebaseAuthError(e));
+    }
+  } else {
+    showToast('Yerel modda şifre sıfırlama yok. Firebase bağlanınca aktif olur.');
+  }
 }
 
 // Profil UI Güncellemesi
@@ -311,18 +517,22 @@ function updateProfileUI(user) {
 }
 
 // Auth State Dinleyicisi
+migrateLocalUsers();
+
 if (isFirebaseConfigured && auth) {
   auth.onAuthStateChanged(user => updateProfileUI(user));
 } else {
-  // Yerel oturumu kontrol et
-  const localSession = getStoredLocalUser();
-  updateProfileUI(localSession);
+  // Yerel oturumu kontrol et (süre dolmuşsa temizlenir)
+  updateProfileUI(getStoredLocalUser());
 }
 
 document.getElementById('authClose').addEventListener('click', closeAuthModal);
 authBackdrop.addEventListener('click', e => { if (e.target === authBackdrop) closeAuthModal(); });
 document.querySelectorAll('.auth-tab').forEach(tab => {
   tab.addEventListener('click', () => switchAuthTab(tab.dataset.tab));
+});
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && authBackdrop.classList.contains('open')) closeAuthModal();
 });
 
 // ==========================================
