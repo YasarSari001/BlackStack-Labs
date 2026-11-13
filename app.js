@@ -1,18 +1,11 @@
 // ==========================================
 // Firebase & Auth Configuration
 // ==========================================
-// NOT: Kendi Firebase projenizin bilgilerini buraya girebilirsiniz.
-// Bilgiler girilmediğinde sistem otomatik olarak "Yerel / Demo Auth" modunda çalışır.
-const firebaseConfig = {
-  apiKey: "YOUR_API_KEY",
-  authDomain: "YOUR_PROJECT.firebaseapp.com",
-  projectId: "YOUR_PROJECT_ID",
-  storageBucket: "YOUR_PROJECT.appspot.com",
-  messagingSenderId: "YOUR_SENDER_ID",
-  appId: "YOUR_APP_ID"
-};
+// Firebase bilgileri firebase-config.js dosyasından okunur.
+// Config boşsa sistem otomatik olarak "Yerel / Demo Auth" modunda çalışır.
+const firebaseConfig = (typeof window !== 'undefined' && window.FIREBASE_CONFIG) ? window.FIREBASE_CONFIG : {};
 
-const isFirebaseConfigured = firebaseConfig.apiKey && firebaseConfig.apiKey !== "YOUR_API_KEY";
+const isFirebaseConfigured = Boolean(firebaseConfig.apiKey && firebaseConfig.projectId);
 
 let auth = null;
 let db = null;

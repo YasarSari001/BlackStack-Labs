@@ -51,11 +51,17 @@ Giriş sistemi iki modda çalışır:
 - Eski düz metin kullanıcılar sayfa açılışında otomatik olarak hash'li formata taşınır.
 - Şifre güç göstergesi, göster/gizle ve form doğrulama desteği.
 
-### Bulut Modu (Firebase)
-`app.js` dosyasının başındaki `firebaseConfig` nesnesine kendi Firebase projenizin bilgilerini girince sistem otomatik olarak Firebase Auth + Firestore moduna geçer:
+### Bulut Modu / Evrensel Giriş (Firebase)
+Tüm cihazlarda geçerli hesaplar için Firebase kullanılır. Kurulum:
+
+1. [Firebase Konsolu](https://console.firebase.google.com) üzerinden proje oluşturun.
+2. **Authentication → Sign-in method** altından **Email/Password** ve **Google** sağlayıcılarını etkinleştirin.
+3. **Firestore Database** oluşturun.
+4. **Proje Ayarları → Genel → Uygulamalar → Web** ile bir web uygulaması ekleyin.
+5. Size verilen bilgileri `firebase-config.js` dosyasına yapıştırın:
 
 ```js
-const firebaseConfig = {
+window.FIREBASE_CONFIG = {
   apiKey: "KENDI_API_KEYIN",
   authDomain: "KENDI_PROJEN.firebaseapp.com",
   projectId: "KENDI_PROJEN_ID",
@@ -65,7 +71,7 @@ const firebaseConfig = {
 };
 ```
 
-Desteklenen özellikler: e-posta/şifre girişi, kayıt, Google ile giriş, şifre sıfırlama e-postası ve "beni hatırla" kalıcılık ayarı.
+Config doldurulduğunda site otomatik olarak bulut moduna geçer; tüm cihazlarda aynı hesapla giriş yapılabilir. Desteklenen özellikler: e-posta/şifre girişi, kayıt, Google ile giriş, şifre sıfırlama e-postası ve "beni hatırla" kalıcılık ayarı.
 
 ---
 
